@@ -18,8 +18,6 @@ st.markdown("""
     .stError { color: #ff4b4b !important; }
     thead tr th:first-child { display:none }
     tbody th { display:none }
-    /* 테이블 가독성 */
-    .stDataFrame { font-size: 1.1rem; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -27,45 +25,56 @@ st.markdown("""
 SHORT_JOURNAL = "short_term_journal.csv"
 LONG_PORTFOLIO = "long_term_portfolio.csv"
 LONG_BALANCE = "long_term_balance.csv"
-LONG_JOURNAL = "long_term_journal.csv" # 장기 매매일지 추가
+LONG_JOURNAL = "long_term_journal.csv"
 
-# 파라미터 고정 (상수)
-RSI_P = 3
-SLOPE_LAG = 2
-TP_HALF = 6.0
-TP_FULL = 12.0
-SL_PCT = -6.0
+# 파라미터 고정
+RSI_P = 3; SLOPE_LAG = 2; TP_HALF = 6.0; TP_FULL = 12.0; SL_PCT = -6.0
 
 # ==========================================
-# 2. 데이터 로딩 (개선판)
+# 2. 데이터 로딩 (안전장치 강화)
 # ==========================================
-@st.cache_data(ttl=1800)
+@st.cache_data(ttl=600) # 캐시 시간 단축
 def load_market_data():
-    start_date = "2010-02-15"
-    tickers = ["TQQQ", "QLD", "QQQ", "KRW=X"]
+    # 1. 주가 데이터 다운로드 (환율 제외)
+    tickers = ["TQQQ", "QLD", "QQQ"]
     try:
-        df = yf.download(tickers, start=start_date, progress=False, group_by='ticker', auto_adjust=False)
-        if df is None or df.empty: return pd.DataFrame()
+        # 안전하게 따로 받기
+        df = yf.download(tickers, period="2y", progress=False, group_by='ticker', auto_adjust=False)
         
+        if df is None or df.empty:
+            return None, "Yahoo Finance 데이터 응답 없음"
+
         data = pd.DataFrame(index=df.index)
+        
+        # 컬럼 추출 (버전 호환성 체크)
         try:
-            data['T_Close'] = df['TQQQ']['Close']; data['T_Open'] = df['TQQQ']['Open']
+            data['T_Close'] = df['TQQQ']['Close']
+            data['T_Open'] = df['TQQQ']['Open']
             data['L_Close'] = df['QLD']['Close']
             data['Q_Close'] = df['QQQ']['Close']
-            if 'KRW=X' in df.columns or ('KRW=X', 'Close') in df.columns:
-                data['USDKRW'] = df['KRW=X']['Close']
-            else: data['USDKRW'] = 1450.0 
-        except: return pd.DataFrame()
+        except KeyError as e:
+            return None, f"데이터 구조 오류: {e}"
+            
+        # 2. 환율 데이터 시도 (실패시 고정값 사용)
+        try:
+            fx = yf.download("KRW=X", period="5d", progress=False)
+            if not fx.empty:
+                current_fx = float(fx['Close'].iloc[-1])
+                data['USDKRW'] = current_fx
+            else:
+                data['USDKRW'] = 1450.0 # 기본값
+        except:
+            data['USDKRW'] = 1450.0
 
-        data['USDKRW'] = data['USDKRW'].ffill().fillna(1450.0)
+        data['USDKRW'] = data['USDKRW'].fillna(1450.0)
         data.dropna(subset=['T_Close', 'Q_Close'], inplace=True)
         
-        # 장기 지표
+        # 3. 지표 계산
         data['Q_MA50'] = data['Q_Close'].rolling(window=50).mean()
         data['Q_MA200'] = data['Q_Close'].rolling(window=200).mean()
         data['ExitLine'] = data['Q_MA200'] * 0.975
         
-        # 단기 지표 (RSI 3 SMA)
+        # RSI 3 SMA
         delta = data['Q_Close'].diff()
         gain = delta.where(delta > 0, 0).rolling(window=3).mean()
         loss = -delta.where(delta < 0, 0).rolling(window=3).mean()
@@ -77,8 +86,10 @@ def load_market_data():
         slope = ma20.pct_change() * 100
         data['Slope_Accel'] = slope > slope.shift(2)
         
-        return data.dropna()
-    except: return pd.DataFrame()
+        return data, None
+
+    except Exception as e:
+        return None, str(e)
 
 # ==========================================
 # 3. 메인 로직
@@ -86,10 +97,18 @@ def load_market_data():
 st.sidebar.title("💎 TQQQ Master")
 mode = st.sidebar.radio("모드 선택", ["🏹 단기 스나이퍼", "🚜 장기 졸업 프로젝트"])
 
-with st.spinner("시장 데이터 동기화 중..."):
-    df = load_market_data()
+# 데이터 로드 실행
+with st.spinner("시장 데이터 접속 중..."):
+    df, error_msg = load_market_data()
 
-if df.empty: st.error("데이터 로드 실패. 다시 시도해주세요."); st.stop()
+# 에러 처리 (화면에 이유 표시)
+if df is None or df.empty:
+    st.error(f"❌ 데이터 로드 실패: {error_msg}")
+    st.warning("팁: 잠시 후 'R' 키를 눌러 새로고침 하거나, 우측 상단 메뉴 > 'Clear cache'를 해보세요.")
+    if st.button("강제 새로고침"):
+        st.cache_data.clear()
+        st.rerun()
+    st.stop()
 
 last = df.iloc[-1]
 curr_date = df.index[-1].date()
@@ -112,11 +131,10 @@ if mode == "🏹 단기 스나이퍼":
 
     tab1, tab2, tab3 = st.tabs(["🏠 내 자산 현황", "🚦 오늘 판독기", "📒 매매일지"])
 
-    # --- Tab 1: 자산 현황 (실현 손익 추가) ---
+    # --- Tab 1: 자산 현황 ---
     with tab1:
         st.header(f"💰 내 자산 현황 ({curr_date})")
         
-        # 보유 중 통계
         open_trades = journal[journal['Status'].isin(['Open', 'Half_Open'])].copy()
         total_invested = 0
         current_val = 0
@@ -127,23 +145,16 @@ if mode == "🏹 단기 스나이퍼":
             current_val = (tqqq_price * open_trades['Shares']).sum()
             unrealized_pnl = current_val - total_invested
 
-        # 실현 손익 (매매 완료된 건들의 Profit 합계)
-        realized_profit = journal['Profit'].sum()
-        
-        # 총 평가 자산 (보유분 평가액 + 이미 실현한 수익)
-        # *주의: 실현 수익은 현금으로 돌아왔다고 가정
+        realized_profit = journal['Profit'].sum() if not journal.empty else 0
+        return_rate = (unrealized_pnl / total_invested * 100) if total_invested > 0 else 0
         
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("총 매수 금액(보유)", f"${total_invested:,.2f}")
         m2.metric("총 평가 자산(보유)", f"${current_val:,.2f}", delta=f"${unrealized_pnl:,.2f}")
-        m3.metric("💸 실현 수익금(누적)", f"${realized_profit:,.2f}", delta_color="normal")
-        
-        # 통합 수익률 (실현+미실현) / (투자원금은 애매하므로 보유분 기준 수익률 표시)
-        return_rate = (unrealized_pnl / total_invested * 100) if total_invested > 0 else 0
+        m3.metric("💸 실현 수익금", f"${realized_profit:,.2f}", delta_color="normal")
         m4.metric("보유분 수익률", f"{return_rate:.2f}%")
 
         st.divider()
-        st.subheader("📦 보유 계좌 상세")
         if not open_trades.empty:
             open_trades['Current_Price'] = tqqq_price
             open_trades['Return(%)'] = (tqqq_price - open_trades['Price']) / open_trades['Price'] * 100
@@ -162,7 +173,7 @@ if mode == "🏹 단기 스나이퍼":
         else:
             st.info("현재 보유 중인 종목이 없습니다.")
 
-    # --- Tab 2: 오늘 판독기 (파라미터 제거됨) ---
+    # --- Tab 2: 오늘 판독기 ---
     with tab2:
         is_bull = last['Q_Close'] >= last['Q_MA200']
         rsi_th = 90 if is_bull else 80
@@ -181,10 +192,9 @@ if mode == "🏹 단기 스나이퍼":
         else:
             st.info("## 💤 [관망] 진입 조건 대기 중")
 
-    # --- Tab 3: 매매일지 (구체화) ---
+    # --- Tab 3: 매매일지 ---
     with tab3:
         st.subheader("📝 단기 매매 기록")
-        
         with st.expander("➕ 매수 기록 추가", expanded=False):
             c1, c2, c3 = st.columns(3)
             bd = c1.date_input("매수일", datetime.today())
@@ -202,50 +212,42 @@ if mode == "🏹 단기 스나이퍼":
                 st.rerun()
         
         if not journal.empty:
-            st.markdown("##### 📜 거래 관리 리스트")
             edit_df = journal.copy()
             edit_df['PnL(%)'] = (tqqq_price - edit_df['Price']) / edit_df['Price'] * 100
             
             for idx, row in edit_df.sort_values('ID', ascending=False).iterrows():
                 with st.container(border=True):
                     col1, col2, col3, col4, col5 = st.columns([1, 2, 2, 2, 3])
-                    
                     status_icon = "🟢" if row['Status'] in ['Open', 'Half_Open'] else "⚪"
                     col1.write(f"**#{row['ID']}** {status_icon}")
                     col2.write(f"{row['Date']}")
-                    col3.write(f"매수: ${row['Price']:.2f} ({row['Shares']}주)")
+                    col3.write(f"${row['Price']:.2f} ({row['Shares']}주)")
                     
                     if row['Status'] in ['Open', 'Half_Open']:
                         p_col = "green" if row['PnL(%)'] > 0 else "red"
-                        col4.markdown(f"수익률: :{p_col}[{row['PnL(%)']:.2f}%]")
-                        
-                        # 매도 옵션 (반/전량)
-                        action = col5.selectbox("매도/삭제", ["-", "반익절 (50%)", "전량 익절/손절", "기록 삭제"], key=f"act_{row['ID']}", label_visibility="collapsed")
-                        
+                        col4.markdown(f":{p_col}[{row['PnL(%)']:.2f}%]")
+                        action = col5.selectbox("액션", ["-", "반익절", "전량매도", "삭제"], key=f"act_{row['ID']}", label_visibility="collapsed")
                         if action != "-":
-                            if st.button(f"실행 ({action})", key=f"btn_{row['ID']}"):
-                                if action == "반익절 (50%)" and row['Status']=='Open':
+                            if st.button(f"확인 ({action})", key=f"btn_{row['ID']}"):
+                                if action == "반익절" and row['Status']=='Open':
                                     sold_shares = row['Shares'] / 2
                                     profit = (tqqq_price - row['Price']) * sold_shares
                                     journal.at[idx, 'Status'] = 'Half_Open'
                                     journal.at[idx, 'Profit'] += profit
-                                    journal.at[idx, 'Shares'] = sold_shares # 남은 수량 업데이트
-                                    
-                                elif action == "전량 익절/손절":
+                                    journal.at[idx, 'Shares'] = sold_shares
+                                elif action == "전량매도":
                                     profit = (tqqq_price - row['Price']) * row['Shares']
                                     journal.at[idx, 'Status'] = 'Closed'
                                     journal.at[idx, 'Profit'] += profit
                                     journal.at[idx, 'Shares'] = 0
-                                    
-                                elif action == "기록 삭제":
+                                elif action == "삭제":
                                     journal = journal.drop(idx)
-                                
                                 journal.to_csv(SHORT_JOURNAL, index=False)
                                 st.rerun()
                     else:
                         p_col = "green" if row['Profit'] > 0 else "red"
-                        col4.markdown(f"확정손익: :{p_col}[${row['Profit']:.2f}]")
-                        col5.caption("거래 종료")
+                        col4.markdown(f"확정: :{p_col}[${row['Profit']:.2f}]")
+                        col5.caption("종료됨")
 
 # ==============================================================================
 # MODE B: 🚜 장기 졸업 프로젝트
@@ -279,10 +281,8 @@ elif mode == "🚜 장기 졸업 프로젝트":
     # --- Tab 1: 자산 현황 ---
     with t1:
         st.header("📦 계좌별 현황")
-        
         rows = []
-        total_invest_krw = 0
-        total_eval_krw = 0
+        total_invest_krw = 0; total_eval_krw = 0
         
         for idx, row in pf_df.iterrows():
             ticker = row['Ticker']
@@ -292,9 +292,9 @@ elif mode == "🚜 장기 졸업 프로젝트":
             
             invest_krw = shares * avg * usd_krw
             eval_krw = shares * cur_p * usd_krw
-            
             total_invest_krw += invest_krw
             total_eval_krw += eval_krw
+            
             pnl_pct = (cur_p - avg) / avg * 100
             
             rows.append({
@@ -303,21 +303,17 @@ elif mode == "🚜 장기 졸업 프로젝트":
                 "수익률": f"{pnl_pct:.2f}%", "평가액(₩)": f"{eval_krw:,.0f}"
             })
         
-        # 합계 계산
         total_asset = cash_krw + total_eval_krw
         total_pnl = total_eval_krw - total_invest_krw
         total_ret = (total_pnl / total_invest_krw * 100) if total_invest_krw > 0 else 0
         
-        # 합계 행 추가
-        df_view = pd.DataFrame(rows)
-        # 1. 대시보드
         c1, c2, c3 = st.columns(3)
         c1.metric("총 평가 자산 (현금포함)", f"{total_asset:,.0f} 원")
         c2.metric("보유 현금", f"{cash_krw:,.0f} 원")
-        c3.metric("주식 수익률 (합산)", f"{total_ret:.2f}%", delta=f"{total_pnl:,.0f} 원")
+        c3.metric("주식 수익률", f"{total_ret:.2f}%", delta=f"{total_pnl:,.0f} 원")
         
         st.divider()
-        st.dataframe(df_view, use_container_width=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
         st.caption(f"적용 환율: {usd_krw:.2f} 원/$")
 
     # --- Tab 2: 오늘의 지령 ---
@@ -325,8 +321,6 @@ elif mode == "🚜 장기 졸업 프로젝트":
         q_c = last['Q_Close']; ma50 = last['Q_MA50']; ma200 = last['Q_MA200']; exit_l = last['ExitLine']
         
         st.subheader("📢 QQQ 위치 판독")
-        
-        # 한눈에 보기 쉬운 테이블
         status_data = [
             {"지표": "MA50 (공격선)", "기준가": f"${ma50:.2f}", "현재가": f"${q_c:.2f}", "상태": "🟢 위 (상승장)" if q_c > ma50 else "⚪ 아래"},
             {"지표": "MA200 (방어선)", "기준가": f"${ma200:.2f}", "현재가": f"${q_c:.2f}", "상태": "🟢 위" if q_c > ma200 else "🔴 아래 (현금화)"},
@@ -335,9 +329,7 @@ elif mode == "🚜 장기 졸업 프로젝트":
         st.dataframe(pd.DataFrame(status_data), use_container_width=True)
         
         st.divider()
-        
-        # 익절 체크
-        st.subheader("💰 계좌별 액션 체크")
+        st.subheader("💰 익절 알림")
         cnt=0
         for idx, row in pf_df.iterrows():
             cur = last['T_Close'] if row['Ticker']=='TQQQ' else last['L_Close']
@@ -347,39 +339,33 @@ elif mode == "🚜 장기 졸업 프로젝트":
                 qty = int(row['Shares']*0.1)
                 st.warning(f"🔔 [익절 신호] 계좌 #{row['Account']} 수익 {pnl:.1f}% 도달! {qty}주 매도하세요.")
                 cnt+=1
-        if cnt==0: st.info("✅ 현재 익절/손절 필요한 계좌가 없습니다. 홀딩하세요.")
+        if cnt==0: st.info("✅ 익절/손절 필요한 계좌가 없습니다.")
 
-    # --- Tab 3: 매매일지 (New) ---
+    # --- Tab 3: 매매일지 ---
     with t3:
-        st.subheader("📒 장기 프로젝트 매매 기록")
-        
-        with st.expander("➕ 거래 기록 추가", expanded=False):
+        st.subheader("📒 장기 매매 기록")
+        with st.expander("➕ 기록 추가", expanded=False):
             c1, c2, c3, c4, c5 = st.columns(5)
             ld = c1.date_input("날짜", datetime.today())
             la = c2.selectbox("계좌", [1, 2, 3, 4])
             lt = c3.selectbox("구분", ["매수", "매도(익절)", "매도(손절)"])
             lq = c4.number_input("수량", 1)
             lp = c5.number_input("단가($)", 0.0)
-            
-            if st.button("기록 저장 (장기)"):
+            if st.button("저장"):
                 amt = lq * lp
                 new_log = {'Date':ld, 'Account':la, 'Type':lt, 'Qty':lq, 'Price':lp, 'Amount':amt, 'Note':'-'}
                 log_df = pd.concat([log_df, pd.DataFrame([new_log])], ignore_index=True)
                 log_df.to_csv(LONG_JOURNAL, index=False)
-                st.success("저장되었습니다.")
                 st.rerun()
         
         if not log_df.empty:
-            # 표시용 포맷팅
             disp_log = log_df.copy().sort_index(ascending=False)
             disp_log['Amount'] = disp_log['Amount'].apply(lambda x: f"${x:,.2f}")
             disp_log['Price'] = disp_log['Price'].apply(lambda x: f"${x:.2f}")
             st.dataframe(disp_log, use_container_width=True)
-            
-            if st.button("맨 위 기록 삭제 (실수 시)"):
+            if st.button("맨 위 기록 삭제"):
                 log_df = log_df[:-1]
-                log_df.to_csv(LONG_JOURNAL, index=False)
-                st.rerun()
+                log_df.to_csv(LONG_JOURNAL, index=False); st.rerun()
 
     # --- Tab 4: 관리 ---
     with t4:
@@ -389,6 +375,6 @@ elif mode == "🚜 장기 졸업 프로젝트":
             if c1.button("입금"): bal_df.iloc[0]['KRW']+=amt; bal_df.to_csv(LONG_BALANCE, index=False); st.rerun()
             if c2.button("출금"): bal_df.iloc[0]['KRW']-=amt; bal_df.to_csv(LONG_BALANCE, index=False); st.rerun()
         
-        st.write("📊 포트폴리오 데이터 수정")
+        st.write("📊 데이터 수정")
         new_pf = st.data_editor(pf_df, num_rows="dynamic")
-        if st.button("변경사항 저장"): new_pf.to_csv(LONG_PORTFOLIO, index=False); st.rerun()
+        if st.button("변경 저장"): new_pf.to_csv(LONG_PORTFOLIO, index=False); st.rerun()
